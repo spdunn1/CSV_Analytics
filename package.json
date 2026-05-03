@@ -1,0 +1,45 @@
+{
+  "name": "derconnect",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "gen:csv": "tsx scripts/gen-csv.ts",
+    "supabase:types": "supabase gen types typescript --local > types/db.ts"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.5.2",
+    "@supabase/supabase-js": "^2.49.4",
+    "@tanstack/react-table": "^8.21.3",
+    "csv-parse": "^5.6.0",
+    "fft.js": "^4.0.4",
+    "inngest": "^3.29.0",
+    "next": "14.2.29",
+    "papaparse": "^5.5.2",
+    "parquetjs-lite": "^0.3.0",
+    "plotly.js-basic-dist": "^2.35.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-plotly.js": "^2.6.0",
+    "uplot": "^1.6.31",
+    "zod": "^3.24.3",
+    "zustand": "^5.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.30",
+    "@types/papaparse": "^5.3.15",
+    "@types/react": "^18.3.20",
+    "@types/react-dom": "^18.3.5",
+    "@types/react-plotly.js": "^2.6.3",
+    "autoprefixer": "^10.4.21",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "14.2.29",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
+  }
+}
