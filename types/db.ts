@@ -116,6 +116,18 @@ export interface Database {
         Insert: Database['public']['Tables']['fft_results']['Row'];
         Update: Partial<Database['public']['Tables']['fft_results']['Row']>;
       };
+      waveform_samples: {
+        Row: {
+          session_id: string;
+          inverter_id: string;
+          phase: number;
+          ts: string;
+          voltage: number | null;
+          current: number | null;
+        };
+        Insert: Database['public']['Tables']['waveform_samples']['Row'];
+        Update: Partial<Database['public']['Tables']['waveform_samples']['Row']>;
+      };
       pmu_samples: {
         Row: {
           session_id: string;
@@ -178,3 +190,4 @@ export type PmuSample = Database['public']['Tables']['pmu_samples']['Row'];
 export type QualityFlag = Database['public']['Tables']['quality_flags']['Row'];
 export type TestEvent = Database['public']['Tables']['test_events']['Row'];
 export type Inverter = Database['public']['Tables']['inverters']['Row'];
+export type WaveformSample = Database['public']['Tables']['waveform_samples']['Row'];

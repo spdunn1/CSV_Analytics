@@ -72,7 +72,6 @@ export function parseCsvBuffer(
   const baseTs = sessionStartTs ?? parseTimestamp(rows[0][mapping.timestamp]);
   const samples: ParsedSample[] = [];
 
-  const SQRT2 = Math.sqrt(2);
   for (const row of rows) {
     const ts = parseTimestamp(row[mapping.timestamp]);
     for (const inv of mapping.inverters) {
@@ -86,11 +85,10 @@ export function parseCsvBuffer(
         const v = parseFloat(row[vcol]);
         const i = parseFloat(row[icol]);
         if (isNaN(v) || isNaN(i)) continue;
-        // For waveform files, columns hold instantaneous V/I; convert to an
-        // RMS approximation. For phasor files, columns are already RMS magnitude.
-        const voltageRms = mapping.fileFormat === 'waveform' ? Math.abs(v) / SQRT2 : v;
-        const currentRms = mapping.fileFormat === 'waveform' ? Math.abs(i) / SQRT2 : i;
-        samples.push({ ts, inverterId: inv.inverterId, phase, voltageRms, currentRms });
+        // For phasor files, columns are already RMS magnitudes.
+        // For waveform files, keep raw instantaneous values — decimate will
+        // compute true RMS (sqrt(mean(v²))) per block before writing to DB.
+        samples.push({ ts, inverterId: inv.inverterId, phase, voltageRms: v, currentRms: i });
       }
     }
   }

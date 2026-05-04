@@ -39,11 +39,11 @@ export function computeWindows(
 
     const vs = windowSamples.map((s) => s.voltageRms);
     const is_ = windowSamples.map((s) => s.currentRms);
+    // True RMS: sqrt(mean(v²)) — correct whether samples are instantaneous or already-RMS.
+    const vMean = rms(vs);
+    const iMean = rms(is_);
     const ps = windowSamples.map((s) => s.voltageRms * s.currentRms);
     const freqs = windowSamples.map((s) => s.freqHz).filter((f): f is number => f !== undefined);
-
-    const vMean = mean(vs);
-    const iMean = mean(is_);
 
     // Store mean voltage for phase imbalance calc
     const imbalKey = `${invId}:${windowIdx}`;
@@ -104,4 +104,9 @@ export function computeWindows(
 function mean(arr: number[]): number {
   if (arr.length === 0) return 0;
   return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function rms(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  return Math.sqrt(arr.reduce((a, v) => a + v * v, 0) / arr.length);
 }

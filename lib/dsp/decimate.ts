@@ -6,11 +6,14 @@ export interface DecimatedGroup {
   samples: { ts: number; voltageRms: number; currentRms: number }[];
 }
 
-// Block-mean decimation: reduce samples to ~targetHz via averaging over windows.
+// Block decimation: reduce samples to ~targetHz.
+// mode='rms'  → compute true RMS (sqrt(mean(v²))) per block — use for raw instantaneous waveform data.
+// mode='mean' → block-average — use for data already in RMS/magnitude form (phasor).
 export function decimate(
   samples: ParsedSample[],
   sourceSampleRateHz: number,
-  targetHz = 10
+  targetHz = 10,
+  mode: 'rms' | 'mean' = 'mean',
 ): ParsedSample[] {
   if (sourceSampleRateHz <= targetHz) return samples;
 
@@ -30,16 +33,24 @@ export function decimate(
       const block = groupSamples.slice(i, i + blockSize);
       if (block.length === 0) continue;
 
-      const sumV = block.reduce((a, s) => a + s.voltageRms, 0);
-      const sumI = block.reduce((a, s) => a + s.currentRms, 0);
       const midTs = block[Math.floor(block.length / 2)].ts;
+
+      let vOut: number;
+      let iOut: number;
+      if (mode === 'rms') {
+        vOut = Math.sqrt(block.reduce((a, s) => a + s.voltageRms * s.voltageRms, 0) / block.length);
+        iOut = Math.sqrt(block.reduce((a, s) => a + s.currentRms * s.currentRms, 0) / block.length);
+      } else {
+        vOut = block.reduce((a, s) => a + s.voltageRms, 0) / block.length;
+        iOut = block.reduce((a, s) => a + s.currentRms, 0) / block.length;
+      }
 
       result.push({
         ts: midTs,
         inverterId: block[0].inverterId,
         phase: block[0].phase,
-        voltageRms: sumV / block.length,
-        currentRms: sumI / block.length,
+        voltageRms: vOut,
+        currentRms: iOut,
         freqHz: block[0].freqHz,
       });
     }

@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
 import { lttb } from '@/lib/dsp/lttb';
 
-const DEFAULT_POINTS = 2000;
+const DEFAULT_POINTS = 5000;
 
 export async function GET(req: NextRequest, { params }: { params: { id: string } }) {
   const supabase = createClient();
@@ -67,7 +67,7 @@ export async function GET(req: NextRequest, { params }: { params: { id: string }
         ts: new Date(r.ts).getTime(),
         v: r.voltage_rms,
         i: r.current_rms,
-        p: r.power_w,
+        p: r.power_w !== null ? r.power_w / 1000 : null, // W → kW
         pf: r.power_factor,
         freq: r.freq_hz,
       }));

@@ -74,14 +74,44 @@ export const ingestCsv = inngest.createFunction(
       }
 
       const invUuidMap = new Map(Object.entries(uuidMap).map(([k, v]) => [parseInt(k), v]));
+      const isWaveform = columnMapping?.fileFormat === 'waveform';
 
-      // Decimate and write to samples_decimated in batches of BATCH_SIZE
       await supabase
         .from('ingest_jobs')
-        .update({ progress: 20 })
+        .update({ progress: 15 })
         .eq('id', jobId);
 
-      const decimated = decimate(result.samples, result.sampleRateHz, DECIMATE_TARGET_HZ);
+      // For waveform files: persist raw instantaneous samples to waveform_samples
+      // so the waveform API can serve them for the raw-waveform chart panel.
+      if (isWaveform) {
+        const wfRows = result.samples.map((s) => ({
+          session_id: sessionId,
+          inverter_id: invUuidMap.get(s.inverterId) ?? '',
+          phase: s.phase,
+          ts: new Date(s.ts).toISOString(),
+          voltage: s.voltageRms, // raw instantaneous V at parse time
+          current: s.currentRms, // raw instantaneous A at parse time
+        }));
+        for (let i = 0; i < wfRows.length; i += BATCH_SIZE) {
+          const { error } = await supabase.from('waveform_samples').insert(wfRows.slice(i, i + BATCH_SIZE));
+          if (error) throw new Error(`Waveform insert failed: ${error.message}`);
+        }
+      }
+
+      await supabase
+        .from('ingest_jobs')
+        .update({ progress: 25 })
+        .eq('id', jobId);
+
+      // Decimate to DECIMATE_TARGET_HZ using RMS mode for waveform (so
+      // the 10 Hz values stored in samples_decimated are true RMS, not
+      // averages that collapse to ~0 for a bipolar sine wave).
+      const decimated = decimate(
+        result.samples,
+        result.sampleRateHz,
+        DECIMATE_TARGET_HZ,
+        isWaveform ? 'rms' : 'mean',
+      );
       const rows: SampleDecimated[] = decimated.map((s) => ({
         session_id: sessionId,
         inverter_id: invUuidMap.get(s.inverterId) ?? '',
