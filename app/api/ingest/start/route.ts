@@ -8,7 +8,7 @@ const bodySchema = z.object({
   sessionId: z.string().uuid(),
   storagePath: z.string(),
   columnMapping: z.any(),
-  sampleRateHz: z.number().min(10).max(3000),
+  sampleRateHz: z.number().min(1).max(10000),
 });
 
 export async function POST(req: NextRequest) {
