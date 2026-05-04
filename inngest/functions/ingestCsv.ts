@@ -5,7 +5,8 @@ import { decimate } from '@/lib/dsp/decimate';
 import { computeWindows } from '@/lib/dsp/windows';
 import { computeFftResults } from '@/lib/dsp/fft';
 import { detectQualityFlags, summarizeFlags } from '@/lib/dsp/quality';
-import type { SampleDecimated } from '@/types/db';
+import type { ParsedSample } from '@/types/csv';
+import type { SampleDecimated, WindowMetric } from '@/types/db';
 
 const BATCH_SIZE = 5000;
 const DECIMATE_TARGET_HZ = 10;
@@ -18,7 +19,7 @@ export const ingestCsv = inngest.createFunction(
   },
   { event: 'csv/uploaded' },
   async ({ event, step }) => {
-    const { sessionId, storagePath, jobId, columnMapping, sampleRateHz } = event.data;
+    const { sessionId, storagePath, jobId, columnMapping } = event.data;
     const supabase = createAdminClient();
 
     // ── Step 1: Download CSV from Storage ────────────────────────────────────
@@ -37,8 +38,9 @@ export const ingestCsv = inngest.createFunction(
       return Buffer.from(arrayBuffer).toString('base64');
     });
 
-    // ── Step 2: Parse CSV ─────────────────────────────────────────────────────
-    const parsed = await step.run('parse', async () => {
+    // ── Step 2: Parse + resolve inverters + write decimated samples ───────────
+    // Returns only small metadata — no samples array crosses the step boundary.
+    const parsed = await step.run('parse-and-write', async () => {
       await supabase
         .from('ingest_jobs')
         .update({ status: 'parsing', progress: 10 })
@@ -46,20 +48,11 @@ export const ingestCsv = inngest.createFunction(
 
       const buffer = Buffer.from(csvBuffer, 'base64');
       const result = parseCsvBuffer(buffer, columnMapping);
-      return {
-        samples: result.samples,
-        startTs: result.startTs,
-        endTs: result.endTs,
-        rowCount: result.rowCount,
-      };
-    });
 
-    // ── Step 3: Resolve / create inverter UUIDs ───────────────────────────────
-    const inverterUuidMap = await step.run('resolve-inverters', async () => {
-      const invIds = [...new Set(parsed.samples.map((s) => s.inverterId))].sort();
-      const map: Record<number, string> = {};
+      // Resolve / create inverter UUIDs
+      const invIds = [...new Set(result.samples.map((s) => s.inverterId))].sort();
+      const uuidMap: Record<number, string> = {};
       for (const invId of invIds) {
-        const serial = `FLX${invId}-${sessionId.slice(0, 8)}`;
         const { data: existing } = await supabase
           .from('inverters')
           .select('id')
@@ -67,7 +60,7 @@ export const ingestCsv = inngest.createFunction(
           .maybeSingle();
 
         if (existing) {
-          map[invId] = existing.id;
+          uuidMap[invId] = existing.id;
         } else {
           const { data: created, error } = await supabase
             .from('inverters')
@@ -75,32 +68,26 @@ export const ingestCsv = inngest.createFunction(
             .select('id')
             .single();
           if (error) throw error;
-          map[invId] = created.id;
+          uuidMap[invId] = created.id;
         }
 
         await supabase
           .from('session_inverters')
-          .upsert({ session_id: sessionId, inverter_id: map[invId], role: `inv${invId}` });
+          .upsert({ session_id: sessionId, inverter_id: uuidMap[invId], role: `inv${invId}` });
       }
-      return map;
-    });
 
-    const uuidMap = new Map<number, string>(
-      Object.entries(inverterUuidMap).map(([k, v]) => [parseInt(k), v])
-    );
+      const invUuidMap = new Map(Object.entries(uuidMap).map(([k, v]) => [parseInt(k), v]));
 
-    // ── Step 4: Decimate + insert samples ─────────────────────────────────────
-    await step.run('write-decimated', async () => {
+      // Decimate and write to samples_decimated in batches of BATCH_SIZE
       await supabase
         .from('ingest_jobs')
-        .update({ status: 'computing', progress: 30 })
+        .update({ progress: 20 })
         .eq('id', jobId);
 
-      const decimated = decimate(parsed.samples, sampleRateHz, DECIMATE_TARGET_HZ);
-
+      const decimated = decimate(result.samples, result.sampleRateHz, DECIMATE_TARGET_HZ);
       const rows: SampleDecimated[] = decimated.map((s) => ({
         session_id: sessionId,
-        inverter_id: uuidMap.get(s.inverterId) ?? '',
+        inverter_id: invUuidMap.get(s.inverterId) ?? '',
         phase: s.phase,
         ts: new Date(s.ts).toISOString(),
         voltage_rms: s.voltageRms,
@@ -113,49 +100,70 @@ export const ingestCsv = inngest.createFunction(
       }));
 
       for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-        const batch = rows.slice(i, i + BATCH_SIZE);
-        const { error } = await supabase.from('samples_decimated').insert(batch);
+        const { error } = await supabase.from('samples_decimated').insert(rows.slice(i, i + BATCH_SIZE));
         if (error) throw new Error(`Decimated insert failed: ${error.message}`);
       }
+
+      // Persist the true detected sample rate back to the session row
+      await supabase
+        .from('sessions')
+        .update({ sample_rate_hz: result.sampleRateHz })
+        .eq('id', sessionId);
+
+      return {
+        rowCount: result.rowCount,
+        startTs: result.startTs,
+        endTs: result.endTs,
+        sampleRateHz: result.sampleRateHz,
+        inverterUuidMap: uuidMap, // Record<number, string> — small object
+      };
     });
 
-    // ── Step 5: Compute 1s window metrics ────────────────────────────────────
+    const uuidMap = new Map<number, string>(
+      Object.entries(parsed.inverterUuidMap).map(([k, v]) => [parseInt(k), v])
+    );
+    // Reverse map for converting DB rows back to numeric inverter IDs
+    const uuidToInvId = new Map<string, number>(
+      Object.entries(parsed.inverterUuidMap).map(([k, v]) => [v, parseInt(k)])
+    );
+
+    // ── Step 3: Compute 1s window metrics (reads from DB) ─────────────────────
     const windows = await step.run('compute-windows', async () => {
       await supabase
         .from('ingest_jobs')
         .update({ progress: 50 })
         .eq('id', jobId);
 
-      return computeWindows(parsed.samples, sessionId, uuidMap);
+      const samples = await queryDecimatedSamples(supabase, sessionId, uuidToInvId);
+      return computeWindows(samples, sessionId, uuidMap);
     });
 
     await step.run('write-windows', async () => {
       for (let i = 0; i < windows.length; i += BATCH_SIZE) {
-        const batch = windows.slice(i, i + BATCH_SIZE);
-        const { error } = await supabase.from('window_metrics_1s').insert(batch);
+        const { error } = await supabase.from('window_metrics_1s').insert(windows.slice(i, i + BATCH_SIZE));
         if (error) throw new Error(`Windows insert failed: ${error.message}`);
       }
     });
 
-    // ── Step 6: Compute FFT / THD ─────────────────────────────────────────────
+    // ── Step 4: Compute FFT / THD (reads from DB) ─────────────────────────────
     const fftResults = await step.run('compute-fft', async () => {
       await supabase
         .from('ingest_jobs')
         .update({ progress: 65 })
         .eq('id', jobId);
 
-      return computeFftResults(parsed.samples, sessionId, uuidMap, sampleRateHz);
+      const samples = await queryDecimatedSamples(supabase, sessionId, uuidToInvId);
+      return computeFftResults(samples, sessionId, uuidMap, parsed.sampleRateHz);
     });
 
     await step.run('write-fft', async () => {
       for (let i = 0; i < fftResults.length; i += BATCH_SIZE) {
-        const batch = fftResults.slice(i, i + BATCH_SIZE);
-        const { error } = await supabase.from('fft_results').insert(batch);
+        const { error } = await supabase.from('fft_results').insert(fftResults.slice(i, i + BATCH_SIZE));
         if (error) throw new Error(`FFT insert failed: ${error.message}`);
       }
     });
 
-    // ── Step 7: Back-fill THD into window_metrics ─────────────────────────────
+    // ── Step 5: Back-fill THD into window_metrics ─────────────────────────────
     await step.run('backfill-thd', async () => {
       await supabase
         .from('ingest_jobs')
@@ -174,19 +182,29 @@ export const ingestCsv = inngest.createFunction(
       }
     });
 
-    // ── Step 8: Detect quality flags ─────────────────────────────────────────
+    // ── Step 6: Detect quality flags (reads from DB) ──────────────────────────
     const qualityFlags = await step.run('detect-quality', async () => {
       await supabase
         .from('ingest_jobs')
         .update({ progress: 85 })
         .eq('id', jobId);
 
-      const windowRows = windows.map((w) => ({
-        ...w,
-        id: 0, // placeholder — not actually stored yet
-      })) as import('@/types/db').WindowMetric[];
+      const samples = await queryDecimatedSamples(supabase, sessionId, uuidToInvId);
 
-      return detectQualityFlags(parsed.samples, windowRows, sessionId, uuidMap, sampleRateHz);
+      const { data: windowRows, error } = await supabase
+        .from('window_metrics_1s')
+        .select('*')
+        .eq('session_id', sessionId)
+        .limit(100000);
+      if (error) throw new Error(`Window query failed: ${error.message}`);
+
+      return detectQualityFlags(
+        samples,
+        (windowRows ?? []) as WindowMetric[],
+        sessionId,
+        uuidMap,
+        parsed.sampleRateHz,
+      );
     });
 
     await step.run('write-quality', async () => {
@@ -196,7 +214,7 @@ export const ingestCsv = inngest.createFunction(
       }
     });
 
-    // ── Step 9: Finalize session ──────────────────────────────────────────────
+    // ── Step 7: Finalize session ──────────────────────────────────────────────
     await step.run('finalize', async () => {
       const { status, counts } = summarizeFlags(qualityFlags);
 
@@ -224,3 +242,29 @@ export const ingestCsv = inngest.createFunction(
     return { sessionId, rowCount: parsed.rowCount };
   }
 );
+
+// Query samples_decimated for a session and convert to ParsedSample[].
+// Supabase default page limit is 1000 rows — use explicit limit to cover large sessions.
+async function queryDecimatedSamples(
+  supabase: ReturnType<typeof createAdminClient>,
+  sessionId: string,
+  uuidToInvId: Map<string, number>,
+): Promise<ParsedSample[]> {
+  const { data, error } = await supabase
+    .from('samples_decimated')
+    .select('*')
+    .eq('session_id', sessionId)
+    .order('ts', { ascending: true })
+    .limit(100000);
+
+  if (error) throw new Error(`samples_decimated query failed: ${error.message}`);
+
+  return (data ?? [] as SampleDecimated[]).map((r: SampleDecimated) => ({
+    ts: new Date(r.ts).getTime(),
+    inverterId: uuidToInvId.get(r.inverter_id) ?? 1,
+    phase: r.phase as 0 | 1 | 2,
+    voltageRms: r.voltage_rms ?? 0,
+    currentRms: r.current_rms ?? 0,
+    freqHz: r.freq_hz ?? undefined,
+  }));
+}
