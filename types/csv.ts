@@ -36,6 +36,7 @@ export interface FdrRow {
 
 export interface ColumnMapping {
   timestamp: string;
+  fileFormat: 'waveform' | 'phasor';
   inverters: {
     inverterId: number; // 1, 2, or 3
     phaseA_voltage: string;
@@ -44,6 +45,13 @@ export interface ColumnMapping {
     phaseB_current?: string;
     phaseC_voltage?: string;
     phaseC_current?: string;
+    // Phasor-only: angle columns (degrees)
+    phaseA_voltage_angle?: string;
+    phaseA_current_angle?: string;
+    phaseB_voltage_angle?: string;
+    phaseB_current_angle?: string;
+    phaseC_voltage_angle?: string;
+    phaseC_current_angle?: string;
   }[];
   pmu?: {
     voltage_mag: string;

@@ -7,7 +7,7 @@ const bodySchema = z.object({
   name: z.string().min(1).max(200),
   description: z.string().optional(),
   test_type: z.string().optional(),
-  sample_rate_hz: z.number().min(10).max(3000),
+  sample_rate_hz: z.number().min(1).max(10000),
   fileName: z.string(),
 });
 
