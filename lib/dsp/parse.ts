@@ -9,14 +9,40 @@ export interface ParsedCsvData {
   rowCount: number;
 }
 
-// Sniff sample rate from timestamps in the first N rows
+// Sniff sample rate from timestamps in the first N rows.
+// Uses sub-millisecond precision for high-rate waveform files.
 export function detectSampleRate(rows: Record<string, string>[], tsCol: string): number {
   if (rows.length < 2) return 1;
-  const t0 = parseTimestamp(rows[0][tsCol]);
-  const t1 = parseTimestamp(rows[1][tsCol]);
-  const dt = Math.abs(t1 - t0);
-  if (dt <= 0) return 1;
-  return Math.round(1000 / dt); // ms → Hz
+  const t0Ms = parseTimestamp(rows[0][tsCol]);
+  const t1Ms = parseTimestamp(rows[1][tsCol]);
+  const dtMs = Math.abs(t1Ms - t0Ms);
+  if (dtMs > 0) {
+    const hz = 1000 / dtMs;
+    // For high rates (>100 Hz) the 1ms resolution loses precision, so prefer
+    // sub-ms parsing of the FDR fractional-second format if present.
+    if (hz < 100) return Math.round(hz);
+  }
+  // FDR timestamp format like "2026/04/29 18:59:40.000333333" — parse the
+  // fractional seconds directly to recover the true delta.
+  const f0 = parseFractionalSeconds(rows[0][tsCol]);
+  const f1 = parseFractionalSeconds(rows[1][tsCol]);
+  if (f0 !== null && f1 !== null) {
+    let dtSec = f1 - f0;
+    if (dtSec < 0) dtSec += 1; // wrapped past a second boundary
+    if (dtSec > 0) return Math.round(1 / dtSec);
+  }
+  if (dtMs > 0) return Math.round(1000 / dtMs);
+  return 1;
+}
+
+function parseFractionalSeconds(raw: string | number | undefined): number | null {
+  if (typeof raw !== 'string') return null;
+  // Match "...HH:MM:SS.fffffffff"
+  const m = raw.match(/(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\s*$/);
+  if (!m) return null;
+  const sec = parseInt(m[3], 10);
+  const frac = m[4] ? parseFloat('0.' + m[4]) : 0;
+  return sec + frac;
 }
 
 export function parseTimestamp(raw: string | number): number {
@@ -25,6 +51,11 @@ export function parseTimestamp(raw: string | number): number {
   if (!isNaN(n)) {
     // Assume seconds if < 1e10, else milliseconds
     return n < 1e10 ? n * 1000 : n;
+  }
+  // FDR format: "2026/04/29 18:59:40.000000000" — Date can't handle 9-digit
+  // fractional seconds or '/' separators in all engines.
+  if (/^\d{4}\/\d{2}\/\d{2}/.test(raw)) {
+    return new Date(raw.replace(/\//g, '-').substring(0, 23)).getTime();
   }
   return new Date(raw).getTime();
 }
@@ -49,6 +80,7 @@ export function parseCsvBuffer(
   const baseTs = sessionStartTs ?? parseTimestamp(rows[0][mapping.timestamp]);
   const samples: ParsedSample[] = [];
 
+  const SQRT2 = Math.sqrt(2);
   for (const row of rows) {
     const ts = parseTimestamp(row[mapping.timestamp]);
     for (const inv of mapping.inverters) {
@@ -62,7 +94,11 @@ export function parseCsvBuffer(
         const v = parseFloat(row[vcol]);
         const i = parseFloat(row[icol]);
         if (isNaN(v) || isNaN(i)) continue;
-        samples.push({ ts, inverterId: inv.inverterId, phase, voltageRms: v, currentRms: i });
+        // For waveform files, columns hold instantaneous V/I; convert to an
+        // RMS approximation. For phasor files, columns are already RMS magnitude.
+        const voltageRms = mapping.fileFormat === 'waveform' ? Math.abs(v) / SQRT2 : v;
+        const currentRms = mapping.fileFormat === 'waveform' ? Math.abs(i) / SQRT2 : i;
+        samples.push({ ts, inverterId: inv.inverterId, phase, voltageRms, currentRms });
       }
     }
   }
@@ -72,6 +108,10 @@ export function parseCsvBuffer(
   return { samples, startTs, endTs, sampleRateHz, rowCount: rows.length };
 }
 
+// Regexes for the two real FDR export formats.
+const WAVEFORM_RE = /CARD\d+:Phase([ABC])\.(Voltage|Current)/i;
+const PHASOR_RE = /SWGR_B_(FDR\d+)_Phase([ABC])(?:_(?:Voltage|Current))?:Phase[ABC]\.(Voltage|Current)\.(Magnitude|Angle)/i;
+
 // Sniff column headers to produce a best-guess ColumnMapping
 export function sniffMapping(headers: string[]): ColumnMapping {
   const h = headers.map((s) => s.toLowerCase().trim());
@@ -79,20 +119,83 @@ export function sniffMapping(headers: string[]): ColumnMapping {
     ['timestamp', 'time', 'ts', 't', 'index'].includes(h[i])
   ) ?? headers[0];
 
-  const inverterMap: Map<number, { [k: string]: string }> = new Map();
+  // FORMAT 1: Waveform — CARDn:Phase{A,B,C}.{Voltage,Current}
+  if (headers.some((c) => WAVEFORM_RE.test(c))) {
+    const cols: Record<string, string> = {};
+    for (const col of headers) {
+      const m = col.match(WAVEFORM_RE);
+      if (!m) continue;
+      const phase = m[1].toUpperCase();
+      const kind = m[2].toLowerCase(); // 'voltage' | 'current'
+      cols[`phase${phase}_${kind}`] = col;
+    }
+    return {
+      timestamp: tsCol,
+      fileFormat: 'waveform',
+      inverters: [
+        {
+          inverterId: 1,
+          phaseA_voltage: cols['phaseA_voltage'] ?? '',
+          phaseA_current: cols['phaseA_current'] ?? '',
+          phaseB_voltage: cols['phaseB_voltage'],
+          phaseB_current: cols['phaseB_current'],
+          phaseC_voltage: cols['phaseC_voltage'],
+          phaseC_current: cols['phaseC_current'],
+        },
+      ],
+    };
+  }
 
+  // FORMAT 2: Phasor — SWGR_B_FDRnn_Phase{A,B,C}_…:Phase{A,B,C}.{Voltage,Current}.{Magnitude,Angle}
+  const phasorMatches = headers
+    .map((col) => ({ col, m: col.match(PHASOR_RE) }))
+    .filter((x): x is { col: string; m: RegExpMatchArray } => x.m !== null);
+
+  if (phasorMatches.length > 0) {
+    // Group by FDR id; pick the first (typically only one per file).
+    const byFdr = new Map<string, Record<string, string>>();
+    for (const { col, m } of phasorMatches) {
+      const fdrId = m[1].toUpperCase(); // e.g. FDR08
+      const phase = m[2].toUpperCase();
+      const kind = m[3].toLowerCase();   // 'voltage' | 'current'
+      const part = m[4].toLowerCase();   // 'magnitude' | 'angle'
+      if (!byFdr.has(fdrId)) byFdr.set(fdrId, {});
+      const key = part === 'magnitude'
+        ? `phase${phase}_${kind}`
+        : `phase${phase}_${kind}_angle`;
+      byFdr.get(fdrId)![key] = col;
+    }
+
+    const inverters = Array.from(byFdr.entries()).map(([fdrId, cols]) => ({
+      inverterId: parseInt(fdrId.replace(/\D/g, ''), 10) || 1,
+      phaseA_voltage: cols['phaseA_voltage'] ?? '',
+      phaseA_current: cols['phaseA_current'] ?? '',
+      phaseB_voltage: cols['phaseB_voltage'],
+      phaseB_current: cols['phaseB_current'],
+      phaseC_voltage: cols['phaseC_voltage'],
+      phaseC_current: cols['phaseC_current'],
+      phaseA_voltage_angle: cols['phaseA_voltage_angle'],
+      phaseA_current_angle: cols['phaseA_current_angle'],
+      phaseB_voltage_angle: cols['phaseB_voltage_angle'],
+      phaseB_current_angle: cols['phaseB_current_angle'],
+      phaseC_voltage_angle: cols['phaseC_voltage_angle'],
+      phaseC_current_angle: cols['phaseC_current_angle'],
+    }));
+
+    return { timestamp: tsCol, fileFormat: 'phasor', inverters };
+  }
+
+  // Legacy fallback: generic inv{N}_ph{A,B,C}_{voltage,current} columns
+  const inverterMap: Map<number, { [k: string]: string }> = new Map();
   for (const col of headers) {
     const lc = col.toLowerCase();
-    // e.g. inv1_phA_voltage, inverter2_phase_b_current, etc.
     const invMatch = lc.match(/inv(?:erter)?(\d)/);
     const phaseMatch = lc.match(/ph(?:ase)?_?([abc])/);
     const kindMatch = lc.match(/(volt|current|amp)/);
     if (!invMatch || !phaseMatch || !kindMatch) continue;
-
     const invNum = parseInt(invMatch[1]);
     const phase = phaseMatch[1].toUpperCase();
     const kind = kindMatch[1].startsWith('volt') ? 'voltage' : 'current';
-
     if (!inverterMap.has(invNum)) inverterMap.set(invNum, {});
     inverterMap.get(invNum)![`phase${phase}_${kind}`] = col;
   }
@@ -108,9 +211,8 @@ export function sniffMapping(headers: string[]): ColumnMapping {
   }));
 
   if (inverters.length === 0) {
-    // Fallback: treat first voltage/current pair as inverter 1 phase A
-    const vCol = headers.find((h) => h.toLowerCase().includes('volt')) ?? headers[1];
-    const iCol = headers.find((h) => h.toLowerCase().includes('curr') || h.toLowerCase().includes('amp')) ?? headers[2];
+    const vCol = headers.find((c) => c.toLowerCase().includes('volt')) ?? headers[1];
+    const iCol = headers.find((c) => c.toLowerCase().includes('curr') || c.toLowerCase().includes('amp')) ?? headers[2];
     inverters.push({ inverterId: 1, phaseA_voltage: vCol, phaseA_current: iCol });
   }
 
@@ -124,7 +226,7 @@ export function sniffMapping(headers: string[]): ColumnMapping {
       }
     : undefined;
 
-  return { timestamp: tsCol, inverters, pmu };
+  return { timestamp: tsCol, fileFormat: 'waveform', inverters, pmu };
 }
 
 // Validate that numeric columns are parseable
