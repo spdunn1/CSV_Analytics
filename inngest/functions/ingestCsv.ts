@@ -22,31 +22,28 @@ export const ingestCsv = inngest.createFunction(
     const { sessionId, storagePath, jobId, columnMapping } = event.data;
     const supabase = createAdminClient();
 
-    // ── Step 1: Download CSV from Storage ────────────────────────────────────
-    const csvBuffer = await step.run('download', async () => {
+    // ── Step 1: Download + parse + write decimated samples ───────────────────
+    // Download and parse are combined in one step so the raw CSV buffer never
+    // crosses a step boundary (a 300 K-row file is ~16 MB base64, which exceeds
+    // Inngest's response size limit).
+    const parsed = await step.run('parse-and-write', async () => {
       await supabase
         .from('ingest_jobs')
         .update({ status: 'downloading', started_at: new Date().toISOString() })
         .eq('id', jobId);
 
-      const { data, error } = await supabase.storage
+      const { data: fileData, error: dlError } = await supabase.storage
         .from('raw')
         .download(storagePath);
+      if (dlError) throw new Error(`Storage download failed: ${dlError.message}`);
 
-      if (error) throw new Error(`Storage download failed: ${error.message}`);
-      const arrayBuffer = await data.arrayBuffer();
-      return Buffer.from(arrayBuffer).toString('base64');
-    });
-
-    // ── Step 2: Parse + resolve inverters + write decimated samples ───────────
-    // Returns only small metadata — no samples array crosses the step boundary.
-    const parsed = await step.run('parse-and-write', async () => {
       await supabase
         .from('ingest_jobs')
         .update({ status: 'parsing', progress: 10 })
         .eq('id', jobId);
 
-      const buffer = Buffer.from(csvBuffer, 'base64');
+      const arrayBuffer = await fileData.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
       const result = parseCsvBuffer(buffer, columnMapping);
 
       // Resolve / create inverter UUIDs
