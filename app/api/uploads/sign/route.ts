@@ -5,8 +5,8 @@ import { z } from 'zod';
 
 const bodySchema = z.object({
   name: z.string().min(1).max(200),
-  description: z.string().optional(),
-  test_type: z.string().optional(),
+  description: z.string().nullish(),
+  test_type: z.string().nullish(),
   sample_rate_hz: z.number().min(1).max(10000),
   fileName: z.string(),
 });
