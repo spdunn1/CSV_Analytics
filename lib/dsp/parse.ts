@@ -9,40 +9,32 @@ export interface ParsedCsvData {
   rowCount: number;
 }
 
-// Sniff sample rate from timestamps in the first N rows.
-// Uses sub-millisecond precision for high-rate waveform files.
+// Sniff sample rate from the delta between the first two timestamps.
+// Uses sub-millisecond precision so 3 kHz FDR files resolve correctly.
 export function detectSampleRate(rows: Record<string, string>[], tsCol: string): number {
   if (rows.length < 2) return 1;
-  const t0Ms = parseTimestamp(rows[0][tsCol]);
-  const t1Ms = parseTimestamp(rows[1][tsCol]);
-  const dtMs = Math.abs(t1Ms - t0Ms);
-  if (dtMs > 0) {
-    const hz = 1000 / dtMs;
-    // For high rates (>100 Hz) the 1ms resolution loses precision, so prefer
-    // sub-ms parsing of the FDR fractional-second format if present.
-    if (hz < 100) return Math.round(hz);
-  }
-  // FDR timestamp format like "2026/04/29 18:59:40.000333333" — parse the
-  // fractional seconds directly to recover the true delta.
-  const f0 = parseFractionalSeconds(rows[0][tsCol]);
-  const f1 = parseFractionalSeconds(rows[1][tsCol]);
-  if (f0 !== null && f1 !== null) {
-    let dtSec = f1 - f0;
-    if (dtSec < 0) dtSec += 1; // wrapped past a second boundary
-    if (dtSec > 0) return Math.round(1 / dtSec);
-  }
-  if (dtMs > 0) return Math.round(1000 / dtMs);
-  return 1;
+  const t0 = parseTimestampHiRes(rows[0][tsCol]);
+  const t1 = parseTimestampHiRes(rows[1][tsCol]);
+  const dtMs = Math.abs(t1 - t0);
+  if (dtMs <= 0) return 1;
+  return Math.round(1000 / dtMs);
 }
 
-function parseFractionalSeconds(raw: string | number | undefined): number | null {
-  if (typeof raw !== 'string') return null;
-  // Match "...HH:MM:SS.fffffffff"
-  const m = raw.match(/(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\s*$/);
-  if (!m) return null;
-  const sec = parseInt(m[3], 10);
-  const frac = m[4] ? parseFloat('0.' + m[4]) : 0;
-  return sec + frac;
+// Returns float milliseconds with sub-ms precision.
+// For FDR format "2026/04/29 18:59:40.000333333":
+//   - parse base to ms via Date (covers digits 1-3 after the decimal point)
+//   - add sub-ms contribution from digits 4+ of the fractional seconds field
+function parseTimestampHiRes(raw: string | number | undefined): number {
+  if (typeof raw === 'number') return raw;
+  if (!raw) return 0;
+  const normalized = raw.replace(/\//g, '-').substring(0, 23); // "YYYY-MM-DD HH:MM:SS.mmm"
+  const baseMs = new Date(normalized).getTime();
+  if (isNaN(baseMs)) return new Date(String(raw)).getTime() || 0;
+  // Digits beyond the 3rd fractional-second digit represent sub-ms precision.
+  // e.g. "18:59:40.000333333" → frac group = "000333333", sub-ms = "333333"
+  const m = raw.match(/:\d{2}\.(\d{4,})/);
+  if (!m) return baseMs;
+  return baseMs + parseFloat('0.' + m[1].slice(3));
 }
 
 export function parseTimestamp(raw: string | number): number {
